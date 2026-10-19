@@ -465,6 +465,9 @@ enrich_total_holdings <- function(data,
 # ║  Deduplicates call numbers for performance and preserves the original      ║
 # ║  row count exactly. Rows that cannot be matched receive NA.                ║
 # ║                                                                            ║
+# ║  Number ranges are upper-inclusive of decimals: a range like 121-128       ║
+# ║  matches 128.1 ... 128.999... (any value below 129), but never 129.        ║
+# ║                                                                            ║
 # ║  Usage:                                                                    ║
 # ║    df <- df |> enrich_selectors(call_number_col = "Call Number")           ║
 # ║    df <- df |> enrich_selectors(call_number_col = "Call Number",           ║
@@ -552,7 +555,9 @@ match_call_number <- function(call_number, df) {
                         Role       = matching_row$Role[i]))
           }
         } else if (length(range) == 2) {
-          if (number >= range[1] && number <= range[2]) {
+          # Upper bound is inclusive of all decimals: 121-128 matches 128,
+          # 128.1, ... up to 128.999... (anything below 129), but not 129.
+          if (number >= range[1] && number < range[2] + 1) {
             return(list(CallNumber = call_number,
                         Selector   = matching_row$Selector[i],
                         Role       = matching_row$Role[i]))
@@ -570,7 +575,6 @@ match_call_number <- function(call_number, df) {
     return(list(CallNumber = call_number, Selector = "ERROR", Role = "ERROR"))
   })
 }
-
 
 # ╔════════════════════════════════════════════════════════════════════════════╗
 # ║  FUNCTION 6: VERNACULAR TITLE EXTRACTION                                   ║
