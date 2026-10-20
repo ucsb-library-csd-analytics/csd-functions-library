@@ -465,8 +465,9 @@ enrich_total_holdings <- function(data,
 # ║  Deduplicates call numbers for performance and preserves the original      ║
 # ║  row count exactly. Rows that cannot be matched receive NA.                ║
 # ║                                                                            ║
-# ║  Number ranges are upper-inclusive of decimals: a range like 121-128       ║
-# ║  matches 128.1 ... 128.999... (any value below 129), but never 129.        ║
+# ║  Every bound is inclusive of its own decimal depth, not floored to         ║
+# ║  the integer. Single value 23 covers 23..23.999...; 84.5 covers            ║
+# ║  84.5..84.599...; range 1-35.2 covers up to 35.2999... (below 35.3).       ║
 # ║                                                                            ║
 # ║  Usage:                                                                    ║
 # ║    df <- df |> enrich_selectors(call_number_col = "Call Number")           ║
@@ -479,32 +480,32 @@ enrich_selectors <- function(data,
                              lookup_df  = NULL,
                              auth_email = NULL,
                              sheet_id   = NULL) {
-
+  
   # If no lookup provided, fetch from Google Sheets
   if (is.null(lookup_df)) {
     auth_email <- auth_email %||% Sys.getenv("GOOGLE_AUTH_EMAIL")
     sheet_id   <- sheet_id   %||% Sys.getenv("SELECTOR_LOOKUP_SHEET_ID")
-
+    
     if (auth_email == "" || sheet_id == "") {
       stop("Google credentials not found. Set GOOGLE_AUTH_EMAIL and SELECTOR_LOOKUP_SHEET_ID in .Renviron, ",
            "or pass lookup_df directly.",
            call. = FALSE)
     }
-
+    
     message("Fetching selector lookup from Google Sheets...")
     gs4_auth(email = auth_email)
     lookup_df <- read_sheet(sheet_id)
   }
-
+  
   original_n   <- nrow(data)
   call_numbers <- data[[call_number_col]]
-
+  
   # Deduplicate for performance — match unique values, then join back
   unique_cn <- unique(na.omit(call_numbers))
   n_unique  <- length(unique_cn)
-
+  
   message("Assigning selectors for ", n_unique, " unique call numbers...")
-
+  
   results <- map_dfr(unique_cn, function(cn) {
     res <- match_call_number(cn, lookup_df)
     tibble(
@@ -513,51 +514,62 @@ enrich_selectors <- function(data,
       Role     = res$Role
     )
   })
-
+  
   # Join back to original data
   data$.cn_key <- call_numbers
   data <- left_join(data, results, by = ".cn_key")
   data$.cn_key <- NULL
-
+  
   stopifnot(
     "Row count changed after selector assignment — this should never happen." =
       nrow(data) == original_n
   )
-
+  
   matched <- sum(!is.na(data$Selector) & data$Selector != "ERROR")
   message("Done. ", matched, " of ", original_n, " rows matched.")
-
+  
   data
 }
 
 # Internal helper: matches a single call number against the lookup table.
 # Returns a list with CallNumber, Selector, and Role.
 match_call_number <- function(call_number, df) {
+  # Exclusive upper edge of a bound, inclusive of its own decimal depth:
+  # 23 -> 24 (covers 23..23.999...), 84.5 -> 84.6 (covers 84.5..84.599...),
+  # 128 -> 129. Rounded to the bound's decimals so it sits on the exact edge.
+  excl_edge <- function(bound_str, bound_num) {
+    d <- if (grepl(".", bound_str, fixed = TRUE)) nchar(sub(".*\\.", "", bound_str)) else 0L
+    round(bound_num + 10^(-d), d)
+  }
+  
   tryCatch({
     subclass <- gsub("^(\\p{L}+).*", "\\1", call_number, perl = TRUE)
     number   <- as.numeric(gsub("[^0-9.]", "", regmatches(
       call_number, regexpr("\\d+(\\.\\d+)?", call_number)
     )))
-
+    
     matching_row <- df[df$Subclass == subclass, ]
-
+    
     if (nrow(matching_row) == 0) {
       return(list(CallNumber = call_number, Selector = NA, Role = NA))
     }
-
+    
     if (any(!is.na(matching_row$`Number range`))) {
       for (i in 1:nrow(matching_row)) {
-        range <- as.numeric(unlist(strsplit(matching_row$`Number range`[i], "-")))
+        range_str <- trimws(unlist(strsplit(matching_row$`Number range`[i], "-")))
+        range     <- as.numeric(range_str)
         if (length(range) == 1) {
-          if (number == range) {
+          # Single value covers its own decimal depth: 23 -> 23..23.999...,
+          # 84.5 -> 84.5..84.599... (not an exact-only match).
+          if (number >= range[1] && number < excl_edge(range_str[1], range[1])) {
             return(list(CallNumber = call_number,
                         Selector   = matching_row$Selector[i],
                         Role       = matching_row$Role[i]))
           }
         } else if (length(range) == 2) {
-          # Upper bound is inclusive of all decimals: 121-128 matches 128,
-          # 128.1, ... up to 128.999... (anything below 129), but not 129.
-          if (number >= range[1] && number < range[2] + 1) {
+          # Upper bound covers its own decimal depth: 1-35.2 covers up to
+          # 35.2999... (below 35.3), 121-128 up to 128.999... (below 129).
+          if (number >= range[1] && number < excl_edge(range_str[2], range[2])) {
             return(list(CallNumber = call_number,
                         Selector   = matching_row$Selector[i],
                         Role       = matching_row$Role[i]))
@@ -569,7 +581,7 @@ match_call_number <- function(call_number, df) {
                   Selector   = matching_row$Selector[1],
                   Role       = matching_row$Role[1]))
     }
-
+    
     return(list(CallNumber = call_number, Selector = NA, Role = NA))
   }, error = function(e) {
     return(list(CallNumber = call_number, Selector = "ERROR", Role = "ERROR"))
